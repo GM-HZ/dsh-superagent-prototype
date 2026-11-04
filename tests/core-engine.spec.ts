@@ -498,6 +498,18 @@ describe('context threads and notes', () => {
     expect(() => h.engine.note(ticketId, 'Too late')).toThrow(new UserError('ticketEnded'))
   })
 })
+it('records note delivery separately from its read receipt and ignores stale assignment deliveries', () => {
+  const h = harness(), ticketId = accepted(h).ticketId!
+  const assignmentId = runningAssignment(h.repo.tickets.get(ticketId)!)!.id
+  const note = h.engine.note(ticketId, 'An existing task produced a new fact').inputs.at(-1)!
+  h.engine.inputsDelivered(ticketId, 'stale-assignment', [note.id])
+  expect(h.repo.tickets.get(ticketId)!.undelivered).toContain(note.id)
+  h.engine.inputsDelivered(ticketId, assignmentId, [note.id])
+  expect(h.repo.tickets.get(ticketId)!.inputs.at(-1)).toMatchObject({ readAt: null, deliveredTo: assignmentId })
+  h.tick(1); h.engine.inputsRead(ticketId, [note.id])
+  expect(h.repo.tickets.get(ticketId)!.inputs.at(-1)).toMatchObject({ readAt: '2026-09-23T00:00:01.000Z', deliveredTo: assignmentId })
+})
+
 describe('follow-up owners', () => {
   const accept = { kind: 'accept' as const, title: 'Y', scope: 'small', reason: 'requested' }
   const decides = (...tickets: string[]) => new UserError('workerDecides', { tickets: tickets.join(', ') })

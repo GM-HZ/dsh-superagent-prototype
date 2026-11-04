@@ -30,8 +30,34 @@ function fixture(history: UserMessage[] = []) {
     inbox.nextStep.splice(0); inbox.nextTurn.splice(0)
     ctx.emit('session/event', agent.session, event(message))
   }
-  return { agent, agents, inbox, steer, followup, injected, open, read, close, flush, send, inject, holds, consume, signal }
+  return { agent, agents, inbox, steer, followup, injected, open, read, close, flush, send, inject, holds, consume, signal, delivery }
 }
+
+it('distinguishes absent, queued and admitted inputs without treating an inbox receipt as model consumption', async () => {
+  const f = fixture()
+  expect(await f.delivery.status(f.agent, 'request')).toBe('absent')
+  await f.send('request', 'queue')
+  expect(await f.delivery.status(f.agent, 'request')).toBe('queued')
+  const message = f.followup.mock.calls[0]![0]
+  f.consume(message)
+  expect(await f.delivery.status(f.agent, 'request')).toBe('context')
+  const restored = fixture([message])
+  expect(await restored.delivery.status(restored.agent, 'request')).toBe('context')
+})
+
+it('preserves explicit user RPC attribution and deduplicates it after session restore', async () => {
+  const f = fixture()
+  await f.delivery.send(f.agent, 'human-input', 'owner request', 'queue', f.signal.signal, undefined, undefined,
+    { kind: 'user', rpcId: 'human-input' })
+  const message = f.followup.mock.calls[0]![0]
+  expect(message.source).toEqual({ kind: 'user', rpcId: 'human-input' })
+  const restored = fixture([message])
+  await restored.delivery.send(restored.agent, 'human-input', 'owner request', 'queue', restored.signal.signal, undefined, undefined,
+    { kind: 'user', rpcId: 'human-input' })
+  expect(restored.followup).not.toHaveBeenCalled()
+  await restored.send('internal-fact', 'queue')
+  expect(restored.followup.mock.calls[0]![0].source).toEqual({ kind: 'dsh-superagent', form: 'relay' })
+})
 
 it.each(['queue', 'steer'] as const)('delivers %s as an orchestrator relay, deduplicating pending and consumed messages', async mode => {
   const f = fixture()

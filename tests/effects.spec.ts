@@ -205,3 +205,27 @@ it('refuses a second handler for a kind', () => {
   effects.handle('relay', async () => {})
   expect(() => effects.handle('relay', async () => {})).toThrow('The relay effects already have a handler')
 })
+
+it('ranks due unordered effects across the full queue and preserves FIFO ties', async () => {
+  const calls: string[] = []
+  effects.handle('launch', async (_payload, key) => { calls.push(key) }, {
+    limit: () => 1, rank: payload => Number((payload as { ticketId: string }).ticketId),
+  })
+  for (let i = 0; i < 20; i++) effects.enqueue('launch', 'low-' + i, { ticketId: '0', assignmentId: 'a' })
+  effects.enqueue('launch', 'high-first', { ticketId: '20', assignmentId: 'a' })
+  effects.enqueue('launch', 'high-second', { ticketId: '20', assignmentId: 'a' })
+  await effects.idle()
+  expect(calls.slice(0, 3)).toEqual(['high-first', 'high-second', 'low-0'])
+  expect(calls).toHaveLength(22)
+})
+
+it('keeps ordered effects in queue order even when a rank function is supplied', async () => {
+  const calls: string[] = []
+  effects.handle('relay', async (_payload, key) => { calls.push(key) }, {
+    ordered: true, rank: payload => Number((payload as { text: string }).text),
+  })
+  effects.enqueue('relay', 'first', relay('0'))
+  effects.enqueue('relay', 'second', relay('100'))
+  await effects.idle()
+  expect(calls).toEqual(['first', 'second'])
+})

@@ -58,13 +58,19 @@ export class AgentDelivery {
     await state.loaded
     return state
   }
+  /** Distinguish committed request history from a pending inbox item. */
+  async status(agent: Agent, requestId: string): Promise<'context' | 'queued' | 'absent'> {
+    const id = messageId(requestId)
+    if ((await this.history(agent)).ids.has(id)) return 'context'
+    return [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some(message => deliveryId(message) === id) ? 'queued' : 'absent'
+  }
   async holds(agent: Agent, requestId: string): Promise<boolean> {
     const id = messageId(requestId)
     return (await this.history(agent)).ids.has(id) || [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some(message => deliveryId(message) === id)
   }
   /** Delivers once to the selected inbox, or injects into history without waking the agent, and flushes Session persistence before acknowledging the producer. */
   async send(agent: Agent, requestId: string, text: string, mode: 'queue' | 'steer' | { inject: string }, signal: AbortSignal, authorize?: () => void,
-    accepted?: () => void): Promise<void> {
+    accepted?: () => void, attribution?: UserMessage['source']): Promise<void> {
     signal.throwIfAborted()
     const seen = await this.history(agent)
     signal.throwIfAborted()
@@ -73,8 +79,8 @@ export class AgentDelivery {
     const id = messageId(requestId)
     const pending = [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some(message => deliveryId(message) === id)
     if (!seen.ids.has(id) && !pending) {
-      const source = typeof mode === 'object' ? { kind: 'dsh-superagent' as const, form: 'notice' as const, summary: mode.inject }
-        : { kind: 'dsh-superagent' as const, form: 'relay' as const }
+      const source = attribution ?? (typeof mode === 'object' ? { kind: 'dsh-superagent' as const, form: 'notice' as const, summary: mode.inject }
+        : { kind: 'dsh-superagent' as const, form: 'relay' as const })
       const message = freezeMessage({ id, role: 'user' as const, content: [{ type: 'text' as const, text }], source })
       if (typeof mode === 'object') { agent.inject(message); seen.ids.add(id) }
       else if (mode === 'steer') agent.steer(message)

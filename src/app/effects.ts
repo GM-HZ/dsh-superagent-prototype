@@ -33,8 +33,10 @@ interface Handler<K extends EffectKind> {
   ordered: boolean
   /** When true, repeated failures do not mark the effect kind's health entry as `error` (used when failures are already surfaced on a ticket). */
   quiet: boolean
+  /** Optional priority among due, unordered effects; greater values launch first. */
+  rank: ((payload: unknown) => number) | undefined
 }
-type Options<K extends EffectKind> = Partial<Pick<Handler<K>, 'limit' | 'retry' | 'ordered' | 'quiet'>>
+type Options<K extends EffectKind> = Partial<Pick<Handler<K>, 'limit' | 'retry' | 'ordered' | 'quiet' | 'rank'>>
 /** `seq` preserves the row's queue position; `generation` increments on payload updates so a running attempt does not delete a newer payload. */
 interface Row { key: string; value: string; seq: number; generation: number; attempts: number; due: number }
 type Task = { kind: EffectKind; key: string; done: Promise<void> }
@@ -67,8 +69,8 @@ export class Effects {
   handle<K extends EffectKind>(kind: K, run: Handler<K>['run'], options: Options<K> = {}): void {
     if (this.handlers.has(kind)) throw new Error(`The ${kind} effects already have a handler`)
     this.health.set(kind, this.board.claim(kind))
-    const { limit = () => 1, retry = [2000, 60_000], ordered = false, quiet = false } = options
-    this.handlers.set(kind, { run, limit: ordered ? () => Math.min(1, limit()) : limit, retry, ordered, quiet } as unknown as Handler<never>)
+    const { limit = () => 1, retry = [2000, 60_000], ordered = false, quiet = false, rank } = options
+    this.handlers.set(kind, { run, limit: ordered ? () => Math.min(1, limit()) : limit, retry, ordered, quiet, rank } as unknown as Handler<never>)
     this.report(kind)
     this.kick()
   }
@@ -109,8 +111,10 @@ export class Effects {
         const rows = (handler.ordered
           ? this.store.db.prepare('SELECT key, value, seq, generation, attempts, due FROM effect WHERE kind = ? ORDER BY seq LIMIT 1').all(kind)
           : this.store.db.prepare('SELECT key, value, seq, generation, attempts, due FROM effect WHERE kind = ? AND due <= ? ORDER BY seq LIMIT ?')
-            .all(kind, this.now(), 16 + running.size)) as unknown as Row[]
+            .all(kind, this.now(), handler.rank ? -1 : 16 + running.size)) as unknown as Row[]
         const ready = handler.ordered && running.size ? [] : rows.filter(row => row.due <= this.now() && !running.has(row.key))
+        const rank = handler.rank
+        if (rank && !handler.ordered) ready.sort((a, b) => rank(JSON.parse(b.value)) - rank(JSON.parse(a.value)) || a.seq - b.seq)
         let room = ready.length ? handler.limit() - running.size : 0
         for (const row of ready) {
           if (room-- <= 0) break
