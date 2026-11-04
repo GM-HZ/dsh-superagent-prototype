@@ -1,7 +1,7 @@
 /** Lifecycle, prompt/tool/skill decoration, message delivery, and budget retry tracking for orchestrator and worker DSH sessions. */
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { MessageId } from '@deepseek-ai/dsh-llm'
+import type { MessageId, UserMessage } from '@deepseek-ai/dsh-llm'
 import { scopeParentOf } from '@deepseek-ai/dsh-scope'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { dirname } from 'node:path'
@@ -36,6 +36,15 @@ export interface SessionsHost {
   environment(ticket: Ticket): Variable[]
   /** Tools to register on the main Session (`ticket === undefined`) or on `ticket`'s worker Session. */
   tools(agent: Agent, ticket?: Ticket): Tool[]
+  /** Optional headless host lifecycle. It owns persistence and permissions;
+   * superagent does not impose its repository preset or full-access policy. */
+  driver?: {
+    resolve(id: string): Promise<{ agent: Agent } | { error: unknown }>
+    ensure(id: string, cwd: string, title: string, role: 'orchestrator' | 'worker'): Promise<Agent>
+  }
+  /** Inherited tools allowed by an embedded main. Locally registered routing
+   * tools remain scoped to that main; the repository preset is the default. */
+  mainTools?: readonly string[]
 }
 
 /**
@@ -104,6 +113,9 @@ export class Sessions {
     host.effects.handle('relay', ({ text }, requestId) => this.prompt(host.masterId, requestId, text, 'steer'), { ordered: true })
     host.effects.handle('notice', ({ value, summary }, name) => this.inject(name, value, summary), { ordered: true })
   }
+  private resolve(id: string): Promise<{ agent: Agent } | { error: unknown }> {
+    return this.host.driver ? this.host.driver.resolve(id) : this.ctx.sessionController.resolveAgent(id as SessionId)
+  }
   /** Subscribes to host agent and session events so newly created sessions are decorated and model-budget retries are reflected in health. Call once at startup. */
   install(): void {
     const ctx = this.ctx
@@ -137,6 +149,13 @@ export class Sessions {
   /** Resolves or creates session `id` in workspace `cwd`, initializes its role model, decorates it with prompts/skills/tools, sets `danger-full-access` permissions, and renames it to `title`. */
   async ensure(id: string, cwd: string, title: string, role: 'orchestrator' | 'worker'): Promise<Agent> {
     const ctx = this.ctx
+    if (this.host.driver) {
+      const agent = await this.host.driver.ensure(id, cwd, title, role)
+      const settings = this.host.store.settings()
+      await initializeRoleModel(ctx, agent, role === 'orchestrator' ? settings.eval.model : settings.executor.model)
+      await this.decorate(agent)
+      return agent
+    }
     let result = await ctx.sessionController.resolveAgent(id as SessionId)
     if ('error' in result && result.error.code === 'session/not-found') {
       const workspace = await ctx.workspaceRegistry.create(cwd)
@@ -155,15 +174,20 @@ export class Sessions {
   }
   /** Returns whether `sessionId` already holds the message delivered under `requestId`, or `false` if the session does not exist. */
   async holds(sessionId: string, requestId: string): Promise<boolean> {
-    const result = await this.ctx.sessionController.resolveAgent(sessionId as SessionId)
+    const result = await this.resolve(sessionId)
     return !('error' in result) && await this.agentDelivery.holds(result.agent, key(requestId))
   }
   /** Deliver a message once per request id: to the next turn, the current one, or `inject`ed with its label without waking the agent. */
   async prompt(sessionId: string, requestId: string, text: string, mode: 'queue' | 'steer' | { inject: string }, authorize?: () => void,
-    accepted?: () => void): Promise<void> {
-    const result = await this.ctx.sessionController.resolveAgent(sessionId as SessionId)
+    accepted?: () => void, attribution?: UserMessage['source']): Promise<void> {
+    const result = await this.resolve(sessionId)
     if ('error' in result) throw result.error
-    await this.agentDelivery.send(result.agent, key(requestId), text, mode, this.host.lifetime, authorize, accepted)
+    await this.agentDelivery.send(result.agent, key(requestId), text, mode, this.host.lifetime, authorize, accepted, attribution)
+  }
+  /** Admission receipt for a main or worker input, across active/restored sessions. */
+  async inputStatus(sessionId: string, requestId: string): Promise<'context' | 'queued' | 'absent'> {
+    const result = await this.resolve(sessionId)
+    return 'error' in result ? 'absent' : this.agentDelivery.status(result.agent, key(requestId))
   }
   /** The id of the message `prompt` delivers under `requestId`, which DSH's inbox events name it by. */
   promptedId(requestId: string): MessageId { return messageId(key(requestId)) }
@@ -178,7 +202,7 @@ export class Sessions {
   }
   /** Injects a notice into the main Session without waking it; no-op if the main Session does not exist yet. */
   private async inject(name: string, value: Record<string, unknown>, summary: string): Promise<void> {
-    const resolved = await this.ctx.sessionController.resolveAgent(this.host.masterId as SessionId)
+    const resolved = await this.resolve(this.host.masterId)
     if ('error' in resolved) return
     // Deduplicate by notice name and payload hash so retries are idempotent while updated payloads still deliver.
     const text = JSON.stringify(value)
@@ -260,7 +284,7 @@ export class Sessions {
     const register = this.registerTool(agent, binding)
     for (const tool of host.tools(agent, ticket)) register(tool.name, tool.description, tool.schema, tool.execute)
     if (master) {
-      binding.disposers.push(agent.ctx.tools.restrict({ allow: ['skill', 'bash', 'read', 'read_image', 'job_output', 'job_list', 'job_kill'] }),
+      binding.disposers.push(agent.ctx.tools.restrict({ allow: [...(host.mainTools ?? ['skill', 'bash', 'read', 'read_image', 'job_output', 'job_list', 'job_kill'])] }),
         agent.ctx.tools.guard(execution => noWait(execution, () => this.routed(agent))))
     } else {
       // An Executor Session keeps the profile's work tools it has, which DSH requires to be known; its own tools are not masked.
